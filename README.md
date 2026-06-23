@@ -70,7 +70,7 @@ This repository is a **single plugin marketplace** (`.claude-plugin/marketplace.
 Install the `ccc` skill so your coding agent automatically uses semantic search when needed:
 
 ```bash
-npx skills add cocoindex-io/cocoindex-code
+npx skills add Roxabi/cocoindex-code
 ```
 
 That's it — no `ccc init` or `ccc index` needed. The skill teaches the agent to handle initialization, indexing, and searching on its own. It will automatically keep the index up to date as you work.
@@ -84,7 +84,7 @@ Works with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and oth
 For Claude Code users, this repository is also a [plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces). Install the skill from inside Claude Code with:
 
 ```text
-/plugin marketplace add cocoindex-io/cocoindex-code
+/plugin marketplace add Roxabi/cocoindex-code
 /plugin install cocoindex-code@cocoindex-code
 ```
 
@@ -105,7 +105,7 @@ Grok does **not** import Claude's `enabledPlugins` or plugin cache; install sepa
 **Full install** (skill + hook + MCP):
 
 ```bash
-grok plugin marketplace add cocoindex-io/cocoindex-code
+grok plugin marketplace add Roxabi/cocoindex-code
 grok plugin install cocoindex-code --trust
 grok plugin enable cocoindex-code
 ```
