@@ -21,6 +21,7 @@ from cocoindex_code.settings import (
     UserSettings,
     _reset_db_path_mapping_cache,
     _reset_host_path_mapping_cache,
+    _user_settings_from_dict,
     default_project_settings,
     default_user_settings,
     find_parent_with_marker,
@@ -55,6 +56,8 @@ def test_default_user_settings() -> None:
     assert s.embedding.model == "Snowflake/snowflake-arctic-embed-xs"
     assert s.embedding.device is None
     assert s.embedding.min_interval_ms is None
+    assert s.embedding.mps_low_watermark_ratio == 0.4
+    assert s.embedding.mps_high_watermark_ratio == 0.5
     assert s.envs == {}
 
 
@@ -77,6 +80,8 @@ def test_save_and_load_user_settings(tmp_path: Path) -> None:
             model="gemini/text-embedding-004",
             device="cpu",
             min_interval_ms=300,
+            mps_low_watermark_ratio=0.35,
+            mps_high_watermark_ratio=0.45,
         ),
         envs={"GEMINI_API_KEY": "test-key"},
     )
@@ -86,7 +91,51 @@ def test_save_and_load_user_settings(tmp_path: Path) -> None:
     assert loaded.embedding.model == settings.embedding.model
     assert loaded.embedding.device == settings.embedding.device
     assert loaded.embedding.min_interval_ms == settings.embedding.min_interval_ms
+    assert loaded.embedding.mps_low_watermark_ratio == settings.embedding.mps_low_watermark_ratio
+    assert loaded.embedding.mps_high_watermark_ratio == settings.embedding.mps_high_watermark_ratio
     assert loaded.envs == settings.envs
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("mps_low_watermark_ratio", 0, "mps_low_watermark_ratio"),
+        ("mps_high_watermark_ratio", 1.1, "mps_high_watermark_ratio"),
+    ],
+)
+def test_embedding_safety_settings_reject_invalid_values(
+    field: str,
+    value: int | float,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        EmbeddingSettings(model="model", **{field: value})
+
+
+def test_embedding_safety_settings_require_ordered_mps_limits() -> None:
+    with pytest.raises(ValueError, match="mps_low_watermark_ratio"):
+        EmbeddingSettings(
+            model="model",
+            mps_low_watermark_ratio=0.6,
+            mps_high_watermark_ratio=0.5,
+        )
+
+
+def test_removed_custom_mps_worker_settings_are_ignored() -> None:
+    settings = _user_settings_from_dict(
+        {
+            "embedding": {
+                "provider": "sentence-transformers",
+                "model": "model",
+                "batch_size": 8,
+                "mps_memory_limit_ratio": 0.35,
+                "worker_timeout_seconds": 300,
+            }
+        }
+    )
+
+    assert settings.embedding.mps_low_watermark_ratio == 0.4
+    assert settings.embedding.mps_high_watermark_ratio == 0.5
 
 
 def test_save_and_load_project_settings(tmp_path: Path) -> None:
@@ -359,8 +408,11 @@ def test_save_initial_user_settings_round_trip() -> None:
     path = save_initial_user_settings(emb, defaults_applied=False)
     content = path.read_text()
 
-    # Hint comment and the four commented env-var examples.
+    # Hint comment, MPS allocator defaults, and env-var examples.
     assert "ccc doctor" in content
+    assert "# mps_low_watermark_ratio: 0.4" in content
+    assert "# mps_high_watermark_ratio: 0.5" in content
+    assert "CocoIndex's GPU subprocess" in content
     assert "# envs:" in content
     for key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "VOYAGE_API_KEY"):
         assert f"#   {key}:" in content
