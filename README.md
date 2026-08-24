@@ -97,7 +97,7 @@ For [Grok](https://github.com/xai-org/grok) users, install via Grok's plugin sys
 | Component | Purpose |
 |-----------|---------|
 | **Skill** (`skills/ccc/`) | Agent runs `ccc search` / `ccc index` via the CLI (same as Claude Code above) |
-| **Hook** (`hooks/hooks.json`) | `SessionStart` → incremental `ccc index` when `.cocoindex_code/` exists |
+| **Hook** (`hooks/hooks.json`) | `SessionStart` + `PostToolUse` (Edit/Write/…) → incremental `ccc index` when `.cocoindex_code/` exists |
 | **MCP** (`.mcp.json`) | `ccc mcp` stdio server — `search` tool with `refresh_index=true` by default |
 
 Grok does **not** import Claude's `enabledPlugins` or plugin cache; install separately even if you already use cocoindex in Claude Code.
@@ -116,7 +116,7 @@ grok plugin enable cocoindex-code
 
 Install and enable as above, then disable the optional components:
 
-1. **Hooks** — open `/hooks`, select the `SessionStart` hook from `cocoindex-code`, press `Space` to disable.
+1. **Hooks** — open `/hooks`, select the `SessionStart` / `PostToolUse` hooks from `cocoindex-code`, press `Space` to disable.
 2. **MCP** — open `/mcps`, select `cocoindex-code`, press `Space` to disable; or persist in `~/.grok/config.toml`:
 
 ```toml
@@ -134,7 +134,25 @@ mcps = false
 
 [compat.cursor]
 mcps = false
+
+#### Oh My Pi plugin
+
+[Oh My Pi](https://github.com/can1357/oh-my-pi) reads `.omp-plugin/marketplace.json`.
+
+```bash
+omp plugin marketplace add Roxabi/cocoindex-code
+omp plugin install cocoindex-code@cocoindex-code --scope user
 ```
+
+Then `/reload-plugins` (or restart the session). Requires `ccc` on `PATH` (`uv tool install --upgrade 'cocoindex-code[full]'`).
+
+| Component | Purpose |
+|-----------|---------|
+| **Skill** (`skills/ccc/`) | Agent runs `ccc search` / `ccc index` via the CLI |
+| **Hook** (`extensions/ccc-index.ts` via `package.json#omp.extensions`) | `session_start` + post-edit `tool_result` → incremental `ccc index` when `.cocoindex_code/` exists |
+| **MCP** (`.mcp.json`) | `ccc mcp` stdio server |
+
+OMP does **not** execute Claude `hooks/hooks.json` command hooks. The TypeScript extension is the OMP equivalent of the Claude/Grok SessionStart + PostToolUse pair.
 
 ### MCP Server
 

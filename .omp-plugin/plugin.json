@@ -1,7 +1,7 @@
 {
   "name": "cocoindex-code",
   "version": "1.0.0",
-  "description": "AST-based semantic code search via the ccc CLI. Bundles the ccc skill; Grok/OMP also activate session-start + post-edit index hooks and MCP (disable either for skill-only).",
+  "description": "AST-based semantic code search via the ccc CLI. Bundles the ccc skill, MCP server, and index hooks (session start + post-edit).",
   "author": {
     "name": "Roxabi",
     "email": "mickael@bouly.io"
@@ -17,8 +17,8 @@
     "indexing",
     "claude-code",
     "grok",
-    "omp",
-    "skill"
+    "skill",
+    "omp"
   ],
-  "hooks": "./hooks/hooks.json"
+  "mcpServers": "./.mcp.json"
 }
