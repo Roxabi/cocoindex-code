@@ -1,7 +1,7 @@
 {
   "name": "cocoindex-code",
   "version": "1.0.0",
-  "description": "AST-based semantic code search for Claude Code, Grok, Cursor, and any skill-compatible coding agent — install in one command.",
+  "description": "AST-based semantic code search for Claude Code, Grok, Cursor, Oh My Pi, and any skill-compatible coding agent — install in one command.",
   "owner": {
     "name": "Roxabi",
     "email": "mickael@bouly.io"
@@ -10,7 +10,7 @@
     {
       "name": "cocoindex-code",
       "source": "./",
-      "description": "Semantic code search — ccc skill, session-start + post-edit index hooks, and MCP server (Grok: disable hook/MCP for skill-only).",
+      "description": "Semantic code search — ccc skill, MCP server (`ccc mcp`), and index hooks (session start + post-edit).",
       "category": "development",
       "tags": [
         "semantic-search",
