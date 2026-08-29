@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
+import msgspec as _msgspec
 import typer as _typer
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
         SearchResponse,
     )
 
+from ._version import __version__
 from .settings import (
     DEFAULT_ST_MODEL,
     EmbeddingSettings,
@@ -76,22 +78,31 @@ def _apply_host_cwd() -> None:
 # ---------------------------------------------------------------------------
 
 
-def require_project_root() -> Path:
+def require_project_root(*, auto_init: bool = False) -> Path:
     """Find the project root by walking up from CWD.
 
     Checks global settings first (more fundamental), then project settings.
-    Exits with code 1 if either check fails.
+    With ``auto_init``, a missing project is initialized with default settings
+    instead of failing. Missing global settings run the same interactive model
+    setup as ``ccc init`` — but only on a TTY, since picking an embedding model
+    is a consequential choice; non-interactive runs (scripts, hooks, agents)
+    still exit with code 1 rather than silently committing to a default model.
     """
     gs_path = user_settings_path()
     if not gs_path.is_file():
-        _typer.echo(
-            f"Error: Global settings not found: {format_path_for_display(gs_path)}\n"
-            "Run `ccc init` to create it with default settings.",
-            err=True,
-        )
-        raise _typer.Exit(code=1)
+        if auto_init and sys.stdin.isatty():
+            _setup_user_settings_interactive(None)
+        else:
+            _typer.echo(
+                f"Error: Global settings not found: {format_path_for_display(gs_path)}\n"
+                "Run `ccc init` to create it with default settings.",
+                err=True,
+            )
+            raise _typer.Exit(code=1)
     root = find_project_root(Path.cwd())
     if root is None:
+        if auto_init:
+            return _auto_init_project(Path.cwd())
         _typer.echo(
             "Error: Not in an initialized project directory.\n"
             "Run `ccc init` in your project root to get started.",
@@ -99,6 +110,24 @@ def require_project_root() -> Path:
         )
         raise _typer.Exit(code=1)
     return root
+
+
+def _auto_init_project(cwd: Path) -> Path:
+    """Create default project settings without an explicit ``ccc init``.
+
+    Anchors at the nearest parent git root when there is one, so running from
+    a repo subdirectory initializes the repo root rather than the subdirectory.
+    """
+    root = find_parent_with_marker(cwd) or cwd
+    _create_project_settings(root)
+    return root
+
+
+def _create_project_settings(root: Path) -> None:
+    """Write default project settings at *root* and gitignore the settings dir."""
+    save_project_settings(root, default_project_settings())
+    add_to_gitignore(root)
+    _typer.echo(f"Created project settings: {format_path_for_display(project_settings_path(root))}")
 
 
 _F = TypeVar("_F", bound=Callable[..., object])
@@ -167,6 +196,15 @@ def print_index_stats(status: ProjectStatusResponse) -> None:
             _typer.echo(f"    {lang}: {count} chunks")
 
 
+def _echo_search_text(text: str) -> None:
+    """Echo result text, replacing characters unsupported by the console codec."""
+    try:
+        _typer.echo(text)
+    except UnicodeEncodeError as error:
+        safe_text = text.encode(error.encoding, errors="replace").decode(error.encoding)
+        _typer.echo(safe_text)
+
+
 def print_search_results(response: SearchResponse) -> None:
     """Print formatted search results."""
     if not response.success:
@@ -179,8 +217,8 @@ def print_search_results(response: SearchResponse) -> None:
 
     for i, r in enumerate(response.results, 1):
         _typer.echo(f"\n--- Result {i} (score: {r.score:.3f}) ---")
-        _typer.echo(f"File: {r.file_path}:{r.start_line}-{r.end_line} [{r.language}]")
-        _typer.echo(r.content)
+        _echo_search_text(f"File: {r.file_path}:{r.start_line}-{r.end_line} [{r.language}]")
+        _echo_search_text(r.content)
 
 
 def _run_index_with_progress(project_root: str) -> None:
@@ -599,12 +637,7 @@ def init(
             )
             raise _typer.Exit(code=1)
 
-    # Create project settings
-    save_project_settings(cwd, default_project_settings())
-    _typer.echo(f"Created project settings: {format_path_for_display(settings_file)}")
-
-    # Add to .gitignore
-    add_to_gitignore(cwd)
+    _create_project_settings(cwd)
 
     _typer.echo("You can edit the settings files to customize indexing behavior.")
     _typer.echo("Run `ccc index` to build the index.")
@@ -616,7 +649,7 @@ def index() -> None:
     """Create/update index for the codebase."""
     from . import client as _client
 
-    project_root = str(require_project_root())
+    project_root = str(require_project_root(auto_init=True))
     print_project_header(project_root)
     _run_index_with_progress(project_root)
     print_index_stats(_client.project_status(project_root))
@@ -631,6 +664,7 @@ def search(
     offset: int = _typer.Option(0, "--offset", help="Number of results to skip"),
     limit: int = _typer.Option(10, "--limit", help="Maximum results to return"),
     refresh: bool = _typer.Option(False, "--refresh", help="Refresh index before searching"),
+    json_output: bool = _typer.Option(False, "--json", help="Output results as JSON"),
 ) -> None:
     """Semantic search across the codebase."""
     project_root = str(require_project_root())
@@ -656,7 +690,14 @@ def search(
         limit=limit,
         offset=offset,
     )
-    print_search_results(resp)
+    if json_output:
+        sys.stdout.buffer.write(_msgspec.json.encode(resp))
+        sys.stdout.buffer.write(b"\n")
+        sys.stdout.buffer.flush()
+        if not resp.success:
+            raise _typer.Exit(code=1)
+    else:
+        print_search_results(resp)
 
 
 @app.command()
@@ -994,11 +1035,18 @@ def mcp() -> None:
     project_root = str(require_project_root())
 
     async def _run_mcp() -> None:
-        from .server import create_mcp_server
+        from .server import create_mcp_server, run_heartbeat_loop
 
         mcp_server = create_mcp_server(project_root)
-        asyncio.create_task(_bg_index(project_root))
-        await mcp_server.run_stdio_async()
+        background_tasks = {
+            asyncio.create_task(_bg_index(project_root)),
+            asyncio.create_task(run_heartbeat_loop()),
+        }
+        try:
+            await mcp_server.run_stdio_async()
+        finally:
+            for task in background_tasks:
+                task.cancel()
 
     asyncio.run(_run_mcp())
 
@@ -1028,6 +1076,8 @@ def daemon_status() -> None:
     resp = _client.daemon_status()
     _typer.echo(f"Daemon version: {resp.version}")
     _typer.echo(f"Uptime: {resp.uptime_seconds:.1f}s")
+    timeout_desc = f"{resp.idle_timeout_minutes}m" if resp.idle_timeout_minutes > 0 else "disabled"
+    _typer.echo(f"Idle: {resp.idle_seconds:.1f}s (timeout: {timeout_desc})")
     if resp.projects:
         _typer.echo("Projects:")
         for p in resp.projects:
@@ -1078,6 +1128,12 @@ def daemon_stop() -> None:
         _typer.echo("Warning: daemon may not have stopped cleanly.", err=True)
     else:
         _typer.echo("Daemon stopped.")
+
+
+@app.command()
+def version() -> None:
+    """Print the CLI version."""
+    _typer.echo(__version__)
 
 
 @app.command("run-daemon", hidden=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,37 @@ from cocoindex_code.cli import (
     require_project_root,
     resolve_default_path,
 )
+from cocoindex_code.protocol import SearchResponse, SearchResult
+
+
+def test_print_search_results_replaces_unencodable_console_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Search output stays usable when the console cannot encode a result."""
+    raw_output = io.BytesIO()
+    gbk_stdout = io.TextIOWrapper(raw_output, encoding="gbk", errors="strict")
+    monkeypatch.setattr(cli.sys, "stdout", gbk_stdout)
+    response = SearchResponse(
+        success=True,
+        results=[
+            SearchResult(
+                file_path="notes↔.md",
+                language="markdown",
+                content="可编码内容: left ↔ right",
+                start_line=1,
+                end_line=1,
+                score=0.9,
+            )
+        ],
+    )
+
+    cli.print_search_results(response)
+    gbk_stdout.flush()
+
+    output = raw_output.getvalue().decode("gbk")
+    assert "可编码内容" in output
+    assert "File: notes?.md" in output
+    assert "left ? right" in output
 
 
 def test_require_project_root_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,6 +81,88 @@ def test_require_project_root_exits_when_not_initialized(
 
     with pytest.raises(Exit):
         require_project_root()
+
+
+def test_require_project_root_auto_init_at_git_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With auto_init, a missing project is initialized at the enclosing git root."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    subdir = repo / "src"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+    settings_dir = tmp_path / "ccc_home"
+    settings_dir.mkdir()
+    (settings_dir / "global_settings.yml").write_text(
+        "embedding:\n  model: test\n  provider: litellm\n"
+    )
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(settings_dir))
+
+    assert require_project_root(auto_init=True) == repo
+    assert (repo / ".cocoindex_code" / "settings.yml").is_file()
+    assert "/.cocoindex_code/" in (repo / ".gitignore").read_text()
+    assert "Created project settings" in capsys.readouterr().out
+
+
+def test_require_project_root_auto_init_falls_back_to_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a parent git root, auto_init initializes the current directory."""
+    standalone = tmp_path / "standalone"
+    standalone.mkdir()
+    monkeypatch.chdir(standalone)
+    settings_dir = tmp_path / "ccc_home"
+    settings_dir.mkdir()
+    (settings_dir / "global_settings.yml").write_text(
+        "embedding:\n  model: test\n  provider: litellm\n"
+    )
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(settings_dir))
+
+    assert require_project_root(auto_init=True) == standalone
+    assert (standalone / ".cocoindex_code" / "settings.yml").is_file()
+
+
+def test_require_project_root_auto_init_global_settings_non_tty_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a TTY, auto_init never creates global settings — scripts must not
+    silently commit to a default embedding model."""
+    standalone = tmp_path / "standalone"
+    standalone.mkdir()
+    monkeypatch.chdir(standalone)
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(tmp_path / "no_ccc_home"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    from click.exceptions import Exit
+
+    with pytest.raises(Exit):
+        require_project_root(auto_init=True)
+    assert not (standalone / ".cocoindex_code").exists()
+
+
+def test_require_project_root_auto_init_global_settings_tty_runs_init_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a TTY, auto_init runs the same interactive model setup as `ccc init`
+    for missing global settings, then proceeds to initialize the project."""
+    standalone = tmp_path / "standalone"
+    standalone.mkdir()
+    monkeypatch.chdir(standalone)
+    settings_dir = tmp_path / "ccc_home"
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(settings_dir))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+
+    def fake_setup(litellm_model_flag: str | None) -> None:
+        settings_dir.mkdir()
+        (settings_dir / "global_settings.yml").write_text(
+            "embedding:\n  model: test\n  provider: litellm\n"
+        )
+
+    monkeypatch.setattr(cli, "_setup_user_settings_interactive", fake_setup)
+
+    assert require_project_root(auto_init=True) == standalone
+    assert (settings_dir / "global_settings.yml").is_file()
+    assert (standalone / ".cocoindex_code" / "settings.yml").is_file()
 
 
 def test_resolve_default_path_from_subdirectory(
@@ -204,6 +318,42 @@ def test_apply_host_cwd_noop_when_unset(
 
     assert Path.cwd() == original_cwd
     assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# ccc version
+# ---------------------------------------------------------------------------
+
+
+def test_version_prints_client_version() -> None:
+    """`ccc version` reports the client version and exits 0."""
+    from typer.testing import CliRunner
+
+    from cocoindex_code._version import __version__
+    from cocoindex_code.cli import app
+
+    result = CliRunner().invoke(app, ["version"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == __version__
+
+
+def test_version_works_outside_a_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No project discovery, no daemon, no settings needed."""
+    from typer.testing import CliRunner
+
+    from cocoindex_code._version import __version__
+    from cocoindex_code.cli import app
+
+    standalone = tmp_path / "not-a-project"
+    standalone.mkdir()
+    monkeypatch.chdir(standalone)
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(tmp_path / "no-such-home"))
+
+    result = CliRunner().invoke(app, ["version"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == __version__
 
 
 # ---------------------------------------------------------------------------

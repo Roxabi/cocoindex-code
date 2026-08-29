@@ -37,6 +37,9 @@ DEFAULT_INCLUDED_PATTERNS: list[str] = [
     "**/*.hxx",  # C++ headers
     "**/*.hh",  # C++ headers
     "**/*.cs",  # C#
+    "**/*.dart",  # Dart
+    "**/*.ex",  # Elixir
+    "**/*.exs",  # Elixir scripts
     "**/*.sql",  # SQL
     "**/*.sh",  # Shell
     "**/*.bash",  # Bash
@@ -97,17 +100,45 @@ class EmbeddingSettings:
     provider: str = "litellm"
     device: str | None = None
     min_interval_ms: int | None = None
+    # PyTorch MPS allocator limits used by CocoIndex's isolated GPU runner.
+    mps_low_watermark_ratio: float = 0.4
+    mps_high_watermark_ratio: float = 0.5
     # Extra kwargs spread into ``embedder.embed()`` during indexing/query.
     # ``None`` means the user did not set the key; ``{}`` is an explicit empty
     # dict (used to opt out of the legacy-bridge warning).
     indexing_params: dict[str, Any] | None = None
     query_params: dict[str, Any] | None = None
 
+    def __post_init__(self) -> None:
+        ratios = (
+            ("mps_low_watermark_ratio", self.mps_low_watermark_ratio),
+            ("mps_high_watermark_ratio", self.mps_high_watermark_ratio),
+        )
+        for name, value in ratios:
+            if isinstance(value, bool) or not 0 < value <= 1:
+                raise ValueError(f"embedding.{name} must be greater than 0 and at most 1")
+
+        if self.mps_low_watermark_ratio > self.mps_high_watermark_ratio:
+            raise ValueError(
+                "embedding.mps_low_watermark_ratio must be at most "
+                "embedding.mps_high_watermark_ratio"
+            )
+
+
+@dataclass
+class DaemonSettings:
+    # Minutes without client activity before the daemon exits (0 = never exit).
+    # Clients auto-restart the daemon on the next request, so exiting is cheap.
+    idle_timeout_minutes: int = 180
+    # Keep the daemon warm while a long-lived MCP client is connected.
+    keep_alive_with_mcp: bool = True
+
 
 @dataclass
 class UserSettings:
     embedding: EmbeddingSettings
     envs: dict[str, str] = field(default_factory=dict)
+    daemon: DaemonSettings = field(default_factory=DaemonSettings)
 
 
 @dataclass
@@ -128,6 +159,8 @@ class ProjectSettings:
     exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
     language_overrides: list[LanguageOverride] = field(default_factory=list)
     chunkers: list[ChunkerMapping] = field(default_factory=list)
+    #: Files larger than this many bytes are excluded. ``None`` means no limit.
+    max_file_size: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +454,11 @@ def _embedding_settings_to_dict(embedding: EmbeddingSettings) -> dict[str, Any]:
         d["device"] = embedding.device
     if embedding.min_interval_ms is not None:
         d["min_interval_ms"] = embedding.min_interval_ms
+    defaults = EmbeddingSettings(model=embedding.model)
+    if embedding.mps_low_watermark_ratio != defaults.mps_low_watermark_ratio:
+        d["mps_low_watermark_ratio"] = embedding.mps_low_watermark_ratio
+    if embedding.mps_high_watermark_ratio != defaults.mps_high_watermark_ratio:
+        d["mps_high_watermark_ratio"] = embedding.mps_high_watermark_ratio
     if embedding.indexing_params is not None:
         d["indexing_params"] = dict(embedding.indexing_params)
     if embedding.query_params is not None:
@@ -432,6 +470,14 @@ def _user_settings_to_dict(settings: UserSettings) -> dict[str, Any]:
     d: dict[str, Any] = {"embedding": _embedding_settings_to_dict(settings.embedding)}
     if settings.envs:
         d["envs"] = dict(settings.envs)
+    daemon_defaults = DaemonSettings()
+    daemon_dict: dict[str, Any] = {}
+    if settings.daemon.idle_timeout_minutes != daemon_defaults.idle_timeout_minutes:
+        daemon_dict["idle_timeout_minutes"] = settings.daemon.idle_timeout_minutes
+    if settings.daemon.keep_alive_with_mcp != daemon_defaults.keep_alive_with_mcp:
+        daemon_dict["keep_alive_with_mcp"] = settings.daemon.keep_alive_with_mcp
+    if daemon_dict:
+        d["daemon"] = daemon_dict
     return d
 
 
@@ -447,6 +493,10 @@ def _user_settings_from_dict(d: dict[str, Any]) -> UserSettings:
         emb_kwargs["device"] = emb_dict["device"]
     if "min_interval_ms" in emb_dict:
         emb_kwargs["min_interval_ms"] = emb_dict["min_interval_ms"]
+    if "mps_low_watermark_ratio" in emb_dict:
+        emb_kwargs["mps_low_watermark_ratio"] = float(emb_dict["mps_low_watermark_ratio"])
+    if "mps_high_watermark_ratio" in emb_dict:
+        emb_kwargs["mps_high_watermark_ratio"] = float(emb_dict["mps_high_watermark_ratio"])
     # indexing_params / query_params: missing → None (dataclass default);
     # present-but-null → {} (treat the same as an empty dict, since both mean
     # "user acknowledged the key and wants no extra kwargs").
@@ -456,7 +506,62 @@ def _user_settings_from_dict(d: dict[str, Any]) -> UserSettings:
         emb_kwargs["query_params"] = dict(emb_dict["query_params"] or {})
     embedding = EmbeddingSettings(**emb_kwargs)
     envs = d.get("envs", {})
-    return UserSettings(embedding=embedding, envs=envs)
+    # `daemon:` section is optional — missing keys use the dataclass defaults.
+    daemon_dict = d.get("daemon") or {}
+    daemon_kwargs: dict[str, Any] = {}
+    if "idle_timeout_minutes" in daemon_dict:
+        daemon_kwargs["idle_timeout_minutes"] = int(daemon_dict["idle_timeout_minutes"])
+    if "keep_alive_with_mcp" in daemon_dict:
+        keep_alive_with_mcp = daemon_dict["keep_alive_with_mcp"]
+        if not isinstance(keep_alive_with_mcp, bool):
+            raise ValueError("daemon.keep_alive_with_mcp must be a boolean")
+        daemon_kwargs["keep_alive_with_mcp"] = keep_alive_with_mcp
+    daemon = DaemonSettings(**daemon_kwargs)
+    return UserSettings(embedding=embedding, envs=envs, daemon=daemon)
+
+
+_SIZE_UNITS: dict[str, int] = {
+    "B": 1,
+    "KB": 1024,
+    "MB": 1024**2,
+    "GB": 1024**3,
+}
+
+
+def parse_file_size(value: Any) -> int:
+    """Parse a ``max_file_size`` value into bytes.
+
+    Accepts a plain number of bytes (``1048576``) or a string with an optional
+    unit suffix (``500KB``, ``1.5 MB``, ``2048``). Units are binary (1KB = 1024
+    bytes) and case-insensitive.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; reject it explicitly.
+        raise ValueError(f"invalid max_file_size: {value!r}")
+    if isinstance(value, int):
+        size = value
+    elif isinstance(value, float):
+        size = int(value)
+    elif isinstance(value, str):
+        text = value.strip().upper()
+        if not text:
+            raise ValueError("invalid max_file_size: empty value")
+        for suffix in ("GB", "MB", "KB", "B"):
+            if text.endswith(suffix):
+                number = text[: -len(suffix)].strip()
+                multiplier = _SIZE_UNITS[suffix]
+                break
+        else:
+            number, multiplier = text, 1
+        try:
+            size = int(float(number) * multiplier)
+        except ValueError as exc:
+            raise ValueError(f"invalid max_file_size: {value!r}") from exc
+    else:
+        raise ValueError(f"invalid max_file_size: {value!r}")
+
+    if size <= 0:
+        raise ValueError(f"max_file_size must be positive, got {value!r}")
+    return size
 
 
 def _project_settings_to_dict(settings: ProjectSettings) -> dict[str, Any]:
@@ -464,6 +569,8 @@ def _project_settings_to_dict(settings: ProjectSettings) -> dict[str, Any]:
         "include_patterns": settings.include_patterns,
         "exclude_patterns": settings.exclude_patterns,
     }
+    if settings.max_file_size is not None:
+        d["max_file_size"] = settings.max_file_size
     if settings.language_overrides:
         d["language_overrides"] = [
             {"ext": lo.ext, "lang": lo.lang} for lo in settings.language_overrides
@@ -478,11 +585,14 @@ def _project_settings_from_dict(d: dict[str, Any]) -> ProjectSettings:
         LanguageOverride(ext=lo["ext"], lang=lo["lang"]) for lo in d.get("language_overrides", [])
     ]
     chunkers = [ChunkerMapping(ext=cm["ext"], module=cm["module"]) for cm in d.get("chunkers", [])]
+    raw_max_size = d.get("max_file_size")
+    max_file_size = None if raw_max_size is None else parse_file_size(raw_max_size)
     return ProjectSettings(
         include_patterns=d.get("include_patterns", list(DEFAULT_INCLUDED_PATTERNS)),
         exclude_patterns=d.get("exclude_patterns", list(DEFAULT_EXCLUDED_PATTERNS)),
         language_overrides=overrides,
         chunkers=chunkers,
+        max_file_size=max_file_size,
     )
 
 
@@ -556,6 +666,13 @@ _PARAMS_COMMENT_BY_PROVIDER: dict[str, str] = {
     ),
 }
 
+_MPS_SAFETY_COMMENT = (
+    "  #\n"
+    "  # Apple Silicon MPS allocator limits for CocoIndex's GPU subprocess.\n"
+    "  # mps_low_watermark_ratio: 0.4\n"
+    "  # mps_high_watermark_ratio: 0.5\n"
+)
+
 
 def save_initial_user_settings(
     embedding: EmbeddingSettings,
@@ -578,6 +695,8 @@ def save_initial_user_settings(
         sort_keys=False,
     )
     content = _INITIAL_HEADER + emb_block
+    if embedding.provider == "sentence-transformers":
+        content += _MPS_SAFETY_COMMENT
     if not defaults_applied:
         hint = _PARAMS_COMMENT_BY_PROVIDER.get(embedding.provider)
         if hint is not None:

@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "description": "AST-based semantic code search via the ccc CLI. Bundles the ccc skill; Grok/OMP also activate session-start + post-edit index hooks and MCP (disable either for skill-only).",
   "author": {
-    "name": "Roxabi",
-    "email": "mickael@bouly.io"
+    "name": "CocoIndex",
+    "email": "hi@cocoindex.io"
   },
-  "homepage": "https://github.com/Roxabi/cocoindex-code",
-  "repository": "https://github.com/Roxabi/cocoindex-code",
+  "homepage": "https://github.com/cocoindex-io/cocoindex-code",
+  "repository": "https://github.com/cocoindex-io/cocoindex-code",
   "license": "Apache-2.0",
   "keywords": [
     "semantic-search",

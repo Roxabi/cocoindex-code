@@ -84,7 +84,7 @@ Works with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and oth
 For Claude Code users, this repository is also a [plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces). Install the skill from inside Claude Code with:
 
 ```text
-/plugin marketplace add Roxabi/cocoindex-code
+/plugin marketplace add cocoindex-io/cocoindex-code
 /plugin install cocoindex-code@cocoindex-code
 ```
 
@@ -109,7 +109,6 @@ grok plugin marketplace add Roxabi/cocoindex-code
 grok plugin install cocoindex-code --trust
 grok plugin enable cocoindex-code
 ```
-
 `--trust` is required so Grok activates the plugin's hooks and MCP server (skills load when the plugin is enabled).
 
 **Skill-only** (match Claude Code — no auto-index hook, no MCP tool):
@@ -134,6 +133,7 @@ mcps = false
 
 [compat.cursor]
 mcps = false
+```
 
 #### Oh My Pi plugin
 
@@ -200,6 +200,41 @@ Or use opencode.json:
 ```
 </details>
 
+<details>
+<summary>Kilo Code</summary>
+
+Add a local MCP server in `~/.config/kilo/kilo.jsonc`, `kilo.jsonc`, or `.kilo/kilo.jsonc`:
+
+```json
+{
+  "mcp": {
+    "cocoindex-code": {
+      "type": "local",
+      "command": ["ccc", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary>Oh My Pi</summary>
+
+Prefer the marketplace install above. Manual project MCP (`.omp/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "cocoindex-code": {
+      "command": "ccc",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
 Once configured, the agent automatically decides when semantic code search is helpful — finding code by description, exploring unfamiliar codebases, fuzzy/conceptual matches, or locating implementations without knowing exact names.
 
 > **Note:** The `cocoindex-code` command (without subcommand) still works as an MCP server for backward compatibility. It auto-creates settings from environment variables on first run.
@@ -237,7 +272,7 @@ ccc search "authentication logic"       # search!
 
 The background daemon starts automatically on first use.
 
-> **Tip:** `ccc index` auto-initializes if you haven't run `ccc init` yet, so you can skip straight to indexing.
+> **Tip:** You can skip `ccc init` and go straight to `ccc index` — it auto-initializes new projects with default settings. If global settings are missing too (first use on the machine), it walks you through the same model setup as `ccc init` when run interactively; non-interactive runs (scripts, hooks) still require a one-time `ccc init` first.
 
 ### CLI Reference
 
@@ -251,6 +286,7 @@ The background daemon starts automatically on first use.
 | `ccc mcp` | Run as MCP server in stdio mode |
 | `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
 | `ccc reset` | Delete index databases. `--all` also removes settings. `-f` skips confirmation. |
+| `ccc version` | Print the CLI version |
 | `ccc daemon status` | Show daemon version, uptime, and loaded projects |
 | `ccc daemon restart` | Restart the background daemon |
 | `ccc daemon stop` | Stop the daemon |
@@ -502,6 +538,8 @@ embedding:
   model: Snowflake/snowflake-arctic-embed-xs
   device: mps                                        # optional: cpu, cuda, mps (auto-detected if omitted)
   min_interval_ms: 300                               # optional: pace LiteLLM embedding requests to reduce 429s; defaults to 5 for LiteLLM
+  mps_low_watermark_ratio: 0.4                       # optional: PyTorch allocator soft limit
+  mps_high_watermark_ratio: 0.5                      # optional: PyTorch allocator hard limit
 
   # Optional extra kwargs passed to the embedder, separately for indexing vs query.
   # `ccc init` auto-populates these for known models (e.g. Cohere, Voyage, Nvidia NIM,
@@ -513,9 +551,19 @@ embedding:
 
 envs:                                                # extra environment variables for the daemon
   OPENAI_API_KEY: your-key                           # only needed if not already in your shell environment
+
+daemon:
+  idle_timeout_minutes: 180                          # optional: exit the daemon after this long without client activity (default 180, 0 = never)
+  keep_alive_with_mcp: true                          # optional: keep the daemon warm while an MCP client is connected (default true)
 ```
 
 > **Note:** The daemon inherits your shell environment. If an API key (e.g. `OPENAI_API_KEY`) is already set as an environment variable, you don't need to duplicate it in `envs`. The `envs` field is only for values that aren't in your environment.
+
+> **Apple Silicon memory safety:** MPS SentenceTransformer calls use [CocoIndex's isolated GPU subprocess](https://github.com/cocoindex-io/cocoindex/blob/v1.0.18/python/cocoindex/_internal/runner.py), keeping the model loaded while isolating Metal allocations from the daemon. The low and high watermarks are ratios of PyTorch's recommended maximum working set; they default here to `0.4` and `0.5`. CocoIndex retries MPS out-of-memory failures with progressively smaller batches, and cocoindex-code [releases unused allocator cache](https://docs.pytorch.org/docs/stable/generated/torch.mps.empty_cache.html) after each index run. Explicit `COCOINDEX_RUN_GPU_IN_SUBPROCESS`, `PYTORCH_MPS_LOW_WATERMARK_RATIO`, and `PYTORCH_MPS_HIGH_WATERMARK_RATIO` environment variables take precedence over these defaults.
+
+> **Indexing concurrency:** Multiple projects may prepare indexes concurrently, while CocoIndex serializes their GPU calls through its single MPS subprocess. A search waits only when its own project still needs the initial index.
+
+> **Idle timeout:** the background daemon holds the embedding model in RAM, so it exits after `daemon.idle_timeout_minutes` without client activity and is restarted automatically on your next `ccc` command or MCP search. By default, a live MCP session sends periodic heartbeats so the daemon remains warm while your coding agent is connected. Set `daemon.keep_alive_with_mcp: false` to let the daemon idle-exit during long-lived MCP sessions and release the model between real requests. Set `idle_timeout_minutes: 0` to keep the daemon running forever.
 
 > **Custom location:** set `COCOINDEX_CODE_DIR` to place `global_settings.yml` somewhere other than `~/.cocoindex_code/` — useful if you want the file to live alongside your projects (e.g. on a synced folder).
 
@@ -563,6 +611,8 @@ exclude_patterns:
   - "**/dist"
   # ...
 
+max_file_size: 500KB       # skip files larger than this (default: no limit)
+
 language_overrides:
   - ext: inc               # treat .inc files as PHP
     lang: php
@@ -573,6 +623,21 @@ chunkers:
 ```
 
 > `.cocoindex_code/` is automatically added to `.gitignore` during init.
+
+`max_file_size` keeps bundled or generated files out of the index without having
+to enumerate them in `exclude_patterns`. It accepts a plain byte count
+(`1048576`) or a size with a binary unit suffix: `B`, `KB`, `MB`, `GB`
+(case-insensitive, so `500KB` and `500 kb` are the same). The limit is
+inclusive, and omitting the key indexes files of any size. It applies wherever
+project file matching does, so `ccc grep` skips the same files.
+
+After editing `include_patterns`, `exclude_patterns`, `max_file_size`, or `language_overrides`:
+
+- Run `ccc doctor` to preview which files match.
+- Run `ccc index` or `ccc search --refresh ...` to update the existing index.
+- You do not need to delete the index or restart the daemon for these file-matching changes.
+
+If you add or change custom `chunkers`, restart the daemon first so the chunker registry is reloaded, then run `ccc index`.
 
 Use `chunkers` when you want to control how a file type is split into chunks before indexing.
 
@@ -772,7 +837,9 @@ embedding:
 | cpp | c++ | `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp` |
 | csharp | csharp, cs | `.cs` |
 | css | | `.css`, `.scss` |
+| dart | | `.dart` |
 | dtd | | `.dtd` |
+| elixir | | `.ex`, `.exs` |
 | fortran | f, f90, f95, f03 | `.f`, `.f90`, `.f95`, `.f03` |
 | go | golang | `.go` |
 | html | | `.html`, `.htm` |

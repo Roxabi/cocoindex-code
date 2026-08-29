@@ -14,8 +14,11 @@ import json
 import os
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel, Field
+
+from ._version import __version__
+from .settings import DaemonSettings, load_user_settings
 
 _MCP_INSTRUCTIONS = (
     "Code search and codebase understanding tools."
@@ -56,9 +59,9 @@ class SearchResultModel(BaseModel):
 # === Daemon-backed MCP server factory ===
 
 
-def create_mcp_server(project_root: str) -> FastMCP:
+def create_mcp_server(project_root: str) -> MCPServer:
     """Create a lightweight MCP server that delegates to the daemon."""
-    mcp = FastMCP("cocoindex-code", instructions=_MCP_INSTRUCTIONS)
+    mcp = MCPServer("cocoindex-code", instructions=_MCP_INSTRUCTIONS, version=__version__)
 
     @mcp.tool(
         name="search",
@@ -159,8 +162,50 @@ def create_mcp_server(project_root: str) -> FastMCP:
     return mcp
 
 
+# === Daemon heartbeat loop ===
+
+
+def heartbeat_interval_s(idle_timeout_minutes: int) -> int:
+    """Heartbeat period for a given idle timeout: a third of the timeout,
+    clamped to [30 s, 300 s] so several heartbeats always fit in one idle
+    window without hammering the daemon on very long timeouts.
+    """
+    return max(30, min(300, idle_timeout_minutes * 60 // 3))
+
+
+async def run_heartbeat_loop() -> None:
+    """Periodically heartbeat the daemon so it never idle-exits under this
+    live MCP session when ``daemon.keep_alive_with_mcp`` is enabled. When the
+    option is disabled, the daemon may idle-exit and the next real request
+    restarts it transparently. When this process dies (even SIGKILL), the
+    heartbeats stop and the daemon exits on its normal idle timeout.
+
+    Reads the timeout from the same ``global_settings.yml`` the daemon reads
+    (dataclass default when the file is missing or invalid). Returns
+    immediately when the timeout is 0 (daemon never idle-exits) or MCP
+    keep-alive is disabled. The heartbeat itself never starts or restarts a
+    daemon — see ``client.send_heartbeat``.
+    """
+    try:
+        daemon_settings = load_user_settings().daemon
+    except (FileNotFoundError, ValueError):
+        daemon_settings = DaemonSettings()
+    timeout_minutes = daemon_settings.idle_timeout_minutes
+    if timeout_minutes <= 0 or not daemon_settings.keep_alive_with_mcp:
+        return
+
+    from .client import send_heartbeat
+
+    interval = heartbeat_interval_s(timeout_minutes)
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(interval)
+        # Client I/O is blocking — run off the event loop thread.
+        await loop.run_in_executor(None, send_heartbeat)
+
+
 # Keep the old `mcp` global for backward compatibility in __init__.py
-mcp: FastMCP | None = None
+mcp: MCPServer | None = None
 
 
 # === Backward-compatible entry point ===
@@ -326,7 +371,14 @@ def main() -> None:
         async def _serve() -> None:
             from .cli import _bg_index
 
-            asyncio.create_task(_bg_index(str(project_root)))
-            await mcp_server.run_stdio_async()
+            background_tasks = {
+                asyncio.create_task(_bg_index(str(project_root))),
+                asyncio.create_task(run_heartbeat_loop()),
+            }
+            try:
+                await mcp_server.run_stdio_async()
+            finally:
+                for task in background_tasks:
+                    task.cancel()
 
         asyncio.run(_serve())

@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def test_omp_marketplace_catalog_points_at_repo_root() -> None:
     catalog = json.loads((REPO_ROOT / ".omp-plugin" / "marketplace.json").read_text())
     assert catalog["name"] == "cocoindex-code"
+
     assert catalog["plugins"][0]["name"] == "cocoindex-code"
     assert catalog["plugins"][0]["source"] == "./"
 
